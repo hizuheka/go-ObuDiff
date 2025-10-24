@@ -15,8 +15,8 @@ import (
 	"github.com/sergi/go-diff/diffmatchpatch"
 )
 
-// diffRegex は {-old-}[+new+] の形式をキャプチャします。
-var diffRegex = regexp.MustCompile(`^\s*\{\-(.*?)\-\}\[\+(.*?)\+\]\s*$`)
+// diffRegex は [-old-]{+new+} の形式をキャプチャします。
+var diffRegex = regexp.MustCompile(`^\s*\[\-(.*?)\-\]\{\+(.*?)\+\}\s*$`)
 
 func main() {
 	// 1. 起動時引数（フラグ）を定義
