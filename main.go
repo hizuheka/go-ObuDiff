@@ -28,13 +28,14 @@ var dmpPool = sync.Pool{
 
 // Config はフラグの値を保持する構造体
 type Config struct {
-	InputPath  string // 空の場合は stdin を示す
-	OutputPath string
-	FormatHTML bool
-	LightMode  bool
-	LineLimit  int
-	FontFamily string
-	Headers    []string
+	InputPath    string // 空の場合は stdin を示す
+	OutputPath   string
+	FormatHTML   bool
+	LightMode    bool
+	EnableFilter bool
+	LineLimit    int
+	FontFamily   string
+	Headers      []string
 }
 
 func main() {
@@ -43,6 +44,7 @@ func main() {
 	outputPath := flag.String("o", "", "出力ファイルパス (必須)")
 	formatHTML := flag.Bool("html", false, "HTML形式で出力する")
 	lightMode := flag.Bool("light", false, "軽量リスト形式(差分のみ)で出力します (デフォルトは全データ形式)")
+	enableFilter := flag.Bool("filter", false, "HTMLテーブル出力時にフィルタ機能(JavaScript)を追加します")
 	lineLimit := flag.Int("n", 0, "処理する最大行数を指定します (0の場合は全行を処理)")
 	defaultFontStack := `"Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Hiragino Sans", Meiryo, sans-serif`
 	fontFamily := flag.String("font", defaultFontStack, "HTML出力時に使用するCSSのfont-familyを指定します")
@@ -74,13 +76,14 @@ func main() {
 
 	// 5. Config 構造体に格納
 	cfg := Config{
-		InputPath:  *inputPath,
-		OutputPath: *outputPath,
-		FormatHTML: *formatHTML,
-		LightMode:  *lightMode,
-		LineLimit:  *lineLimit,
-		FontFamily: *fontFamily,
-		Headers:    headers,
+		InputPath:    *inputPath,
+		OutputPath:   *outputPath,
+		FormatHTML:   *formatHTML,
+		LightMode:    *lightMode,
+		EnableFilter: *enableFilter,
+		LineLimit:    *lineLimit,
+		FontFamily:   *fontFamily,
+		Headers:      headers,
 	}
 
 	// 6. 入力ストリームのセットアップ
@@ -153,7 +156,7 @@ func executeProcessing(cfg Config, reader *csv.Reader, writer io.Writer, dmp *di
 
 	if cfg.FormatHTML {
 		logger.Info("HTML形式 (全データテーブル) で処理を開始します...")
-		return processHTMLAsTable(reader, writer, dmp, cfg.FontFamily, cfg.LineLimit, cfg.Headers)
+		return processHTMLAsTable(reader, writer, dmp, cfg.FontFamily, cfg.LineLimit, cfg.Headers, cfg.EnableFilter)
 	}
 	// 全データ CSV
 	logger.Info("CSV形式 (全データ) で処理を開始します...")
@@ -289,8 +292,8 @@ func processHTMLAsList(reader *csv.Reader, writer io.Writer, dmp *diffmatchpatch
 }
 
 // processHTMLAsTable は、全データをテーブル形式で書き出します。
-func processHTMLAsTable(reader *csv.Reader, writer io.Writer, dmp *diffmatchpatch.DiffMatchPatch, fontFamily string, lineLimit int, headers []string) error {
-	writeHTMLHeaderTable(writer, fontFamily, headers)
+func processHTMLAsTable(reader *csv.Reader, writer io.Writer, dmp *diffmatchpatch.DiffMatchPatch, fontFamily string, lineLimit int, headers []string, enableFilter bool) error {
+	writeHTMLHeaderTable(writer, fontFamily, headers, enableFilter)
 
 	io.WriteString(writer, "<tbody>\n")
 	var lineCount int
@@ -320,7 +323,7 @@ func processHTMLAsTable(reader *csv.Reader, writer io.Writer, dmp *diffmatchpatc
 		writeHTMLDataRowTable(writer, outputCells)
 	}
 	io.WriteString(writer, "</tbody>\n")
-	writeHTMLFooterTable(writer)
+	writeHTMLFooterTable(writer, enableFilter)
 	return nil
 }
 
@@ -370,7 +373,7 @@ func formatDiffsToHTML(diffs []diffmatchpatch.Diff) string {
 	return builder.String()
 }
 
-// --- HTMLヘルパー関数 ---
+// --- HTMLヘルパー (リストモード) ---
 
 func writeHTMLHeaderList(w io.Writer, fontFamily string) {
 	safeFontFamily := strings.ReplaceAll(fontFamily, "<", "")
@@ -414,7 +417,9 @@ func writeHTMLFooterList(w io.Writer) {
 `)
 }
 
-func writeHTMLHeaderTable(w io.Writer, fontFamily string, headers []string) {
+// --- HTMLヘルパー (テーブルモード) ---
+
+func writeHTMLHeaderTable(w io.Writer, fontFamily string, headers []string, enableFilter bool) {
 	safeFontFamily := strings.ReplaceAll(fontFamily, "<", "")
 	safeFontFamily = strings.ReplaceAll(safeFontFamily, ">", "")
 	io.WriteString(w, `<!DOCTYPE html>
@@ -429,14 +434,36 @@ func writeHTMLHeaderTable(w io.Writer, fontFamily string, headers []string) {
         .diff-del { color: #d32f2f; text-decoration: line-through; background-color: #ffebee; }
         .diff-add { color: #388e3c; font-weight: bold; text-decoration: none; background-color: #e8f5e9; }
         table { border-collapse: collapse; margin: 20px 0; font-size: 0.9em; }
-        th, td { border: 1px solid #ccc; padding: 8px 12px; vertical-align: top; text-align: left; }
+        th, td { 
+            border: 1px solid #ccc; 
+            padding: 8px 12px; 
+            vertical-align: top; 
+            text-align: left; 
+            white-space: nowrap; 
+        }
         thead th { background-color: #f0f0f0; }
         tbody tr:nth-child(odd) { background-color: #f9f9f9; }
-    </style>
+`)
+	if enableFilter {
+		io.WriteString(w, `
+        .filter-input {
+            width: 100%;
+            box-sizing: border-box;
+            padding: 4px;
+            margin-top: 5px;
+            border: 1px solid #ccc;
+            border-radius: 3px;
+            font-size: 0.9em;
+        }
+`)
+	}
+
+	io.WriteString(w, `    </style>
 </head>
 <body>
     <h1>差分比較結果 (全データ)</h1>
-    <table>
+    <div style="overflow-x: auto;">
+        <table id="diffTable">
 `)
 	if headers != nil {
 		io.WriteString(w, "<thead>\n<tr>\n")
@@ -455,9 +482,64 @@ func writeHTMLDataRowTable(w io.Writer, cells []string) {
 	io.WriteString(w, "</tr>\n")
 }
 
-func writeHTMLFooterTable(w io.Writer) {
-	io.WriteString(w, `</table>
-</body>
+func writeHTMLFooterTable(w io.Writer, enableFilter bool) {
+	io.WriteString(w, `        </table>
+    </div>
+`)
+
+	if enableFilter {
+		io.WriteString(w, `
+<script>
+(function() {
+    const table = document.getElementById("diffTable");
+    if (!table) return;
+
+    const headers = table.querySelectorAll("thead th");
+    if (headers.length === 0) return;
+
+    headers.forEach((th, index) => {
+        const input = document.createElement("input");
+        input.type = "text";
+        input.className = "filter-input";
+        input.placeholder = "Filter...";
+        input.addEventListener("input", function() {
+            filterTable();
+        });
+        th.appendChild(document.createElement("br"));
+        th.appendChild(input);
+    });
+
+    function filterTable() {
+        const rows = table.querySelectorAll("tbody tr");
+        const inputs = table.querySelectorAll(".filter-input");
+        const filters = [];
+        inputs.forEach((input, index) => {
+            filters[index] = input.value.toLowerCase();
+        });
+
+        rows.forEach(row => {
+            const cells = row.cells;
+            let shouldShow = true;
+            for (let i = 0; i < filters.length; i++) {
+                const filterText = filters[i];
+                if (!filterText) continue;
+                if (cells[i]) {
+                    const cellText = cells[i].innerText.toLowerCase();
+                    if (!cellText.includes(filterText)) {
+                        shouldShow = false;
+                        break;
+                    }
+                }
+            }
+            row.style.display = shouldShow ? "" : "none";
+        });
+    }
+})();
+</script>
+`)
+	}
+
+	io.WriteString(w, `</body>
 </html>
 `)
 }

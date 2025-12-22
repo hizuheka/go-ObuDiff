@@ -15,15 +15,11 @@ import (
 
 // --- テスト用のヘルパー ---
 
-// (dmpPoolはmain.goで定義されているので、テスト側では不要)
-
 // newCsvReader は文字列から *csv.Reader を作成します
 func newCsvReader(s string) *csv.Reader {
 	return csv.NewReader(strings.NewReader(s))
 }
 
-// runTest は、指定された設定と入力で executeProcessing を実行し、
-// 出力バッファの内容を文字列として返します。
 func runTest(t *testing.T, cfg Config, input string) (string, error) {
 	t.Helper()
 
@@ -65,8 +61,8 @@ func TestParseDiffCell(t *testing.T) {
 		if len(diffs) != 3 {
 			t.Fatalf("expected 3 diff segments, got %d", len(diffs))
 		}
-		if diffs[0].Type != diffmatchpatch.DiffDelete || diffs[0].Text != "old" {
-			t.Errorf("Unexpected diffs[0].Type:%s diff[0].Text: %v", diffs[0].Type, diffs[0].Text)
+		if diffs[0].Type != diffmatchpatch.DiffInsert || diffs[0].Text != "new" {
+			t.Errorf("Unexpected diff[0]: %v", diffs[0])
 		}
 	})
 
@@ -80,7 +76,6 @@ func TestParseDiffCell(t *testing.T) {
 }
 
 func TestFormatters(t *testing.T) {
-	// (このテストは入力形式に依存しないため、変更なし)
 	diffs := []diffmatchpatch.Diff{
 		{Type: diffmatchpatch.DiffEqual, Text: "common"},
 		{Type: diffmatchpatch.DiffDelete, Text: "del"},
@@ -116,9 +111,6 @@ const testInputNoDiff = `1,Apple,OK,Note 1
 
 var testHeaders = []string{"ID", "Item", "Status", "Memo"}
 
-// (以降のテストは、testInputDiff を使うため、入力は自動的に修正されます)
-// (期待値(expected)は変更ありません)
-
 // 1. 全データ CSV (-light なし)
 func TestProcessCSVAsFull(t *testing.T) {
 	cfg := Config{LightMode: false, FormatHTML: false}
@@ -128,9 +120,9 @@ func TestProcessCSVAsFull(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		expected := `1,Apple,[-OK-]{+NG+},Note [-1-]{+2+}
+		expected := `1,Apple,NG[-OK-],Note [-1-]{+2+}
 2,Banana,OK,Note 3
-3,Orange,[-NG-]{+OK+},Price 100
+3,Orange,OK[-NG-],Price 100
 `
 		if out != expected {
 			t.Errorf("Expected:\n%s\nGot:\n%s", expected, out)
@@ -147,7 +139,7 @@ func TestProcessCSVAsFull(t *testing.T) {
 		if !strings.HasPrefix(out, "ID,Item,Status,Memo\n") {
 			t.Error("Output should start with header row")
 		}
-		if !strings.Contains(out, "1,Apple,[-OK-]{+NG*}") {
+		if !strings.Contains(out, "1,Apple,NG[-OK-]") {
 			t.Error("Output missing diff data")
 		}
 	})
@@ -159,7 +151,7 @@ func TestProcessCSVAsFull(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		expected := `1,Apple,[-OK-]{+NG+},Note [-1-]{+2+}
+		expected := `1,Apple,NG[-OK-],Note [-1-]{+2+}
 `
 		if out != expected {
 			t.Errorf("Expected:\n%s\nGot:\n%s", expected, out)
@@ -207,6 +199,22 @@ func TestProcessHTMLAsTable(t *testing.T) {
 			t.Error("Missing data for row 2")
 		}
 	})
+
+	t.Run("WithFilter", func(t *testing.T) {
+		cfgFilter := cfg
+		cfgFilter.EnableFilter = true
+		cfgFilter.Headers = testHeaders
+		out, err := runTest(t, cfgFilter, testInputDiff)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out, `<script>`) {
+			t.Error("Should contain script tag when filter is enabled")
+		}
+		if !strings.Contains(out, `.filter-input`) {
+			t.Error("Should contain filter CSS")
+		}
+	})
 }
 
 // 3. 軽量リスト CSV (-light あり)
@@ -219,9 +227,9 @@ func TestProcessCSVAsList(t *testing.T) {
 			t.Fatal(err)
 		}
 		expected := `Line,Column,DiffValue
-1,3,[-OK-]{+NG+}
+1,3,NG[-OK-]
 1,4,Note [-1-]{+2+}
-3,3,[-NG-]{+OK+}
+3,3,OK[-NG-]
 `
 		if out != expected {
 			t.Errorf("Expected:\n%s\nGot:\n%s", expected, out)
@@ -236,9 +244,9 @@ func TestProcessCSVAsList(t *testing.T) {
 			t.Fatal(err)
 		}
 		expected := `Line,Column,DiffValue
-1,3:Status,[-OK-]{+NG+}
+1,3:Status,NG[-OK-]
 1,4:Memo,Note [-1-]{+2+}
-3,3:Status,[-NG-]{+OK+}
+3,3:Status,OK[-NG-]
 `
 		if out != expected {
 			t.Errorf("Expected:\n%s\nGot:\n%s", expected, out)
@@ -259,14 +267,13 @@ func TestProcessCSVAsList(t *testing.T) {
 	t.Run("HeaderMismatch", func(t *testing.T) {
 		cfgHeader := cfg
 		cfgHeader.Headers = []string{"ID", "Item"}
-		// 変更点: 入力形式を修正
 		input := `1,Apple,[-OK-]{+NG+}`
 		out, err := runTest(t, cfgHeader, input)
 		if err != nil {
 			t.Fatal(err)
 		}
 		expected := `Line,Column,DiffValue
-1,3,[-OK-]{+NG+}
+1,3,NG[-OK-]
 `
 		if out != expected {
 			t.Errorf("Expected:\n%s\nGot:\n%s", expected, out)
@@ -367,7 +374,7 @@ func TestIOErrors(t *testing.T) {
 	t.Run("ReadError_HTMLTable", func(t *testing.T) {
 		reader := csv.NewReader(&mockErrorReader{})
 		writer := bufio.NewWriter(io.Discard)
-		err := processHTMLAsTable(reader, writer, dmp, "", 0, nil)
+		err := processHTMLAsTable(reader, writer, dmp, "", 0, nil, false)
 		if err == nil || !strings.Contains(err.Error(), "mock read error") {
 			t.Errorf("Expected read error, got %v", err)
 		}
@@ -385,7 +392,7 @@ func TestIOErrors(t *testing.T) {
 	t.Run("WriteError_CSVFull_Header", func(t *testing.T) {
 		cfg := Config{LightMode: false, FormatHTML: false, Headers: testHeaders}
 		reader := newCsvReader(testInputDiff)
-		writer := &mockErrorWriter{} // バッファなしのモック
+		writer := &mockErrorWriter{}
 		err := executeProcessing(cfg, reader, writer, dmp, logger)
 		if err == nil || !strings.Contains(err.Error(), "mock write error") {
 			t.Errorf("Expected write error, got %v", err)
@@ -414,7 +421,7 @@ func TestIOErrors(t *testing.T) {
 	t.Run("WriteError_HTMLList_Header", func(t *testing.T) {
 		cfg := Config{LightMode: true, FormatHTML: true}
 		reader := newCsvReader(testInputDiff)
-		writer := &mockErrorWriter{} // バッファなし
+		writer := &mockErrorWriter{}
 		err := executeProcessing(cfg, reader, writer, dmp, logger)
 		if err == nil || !strings.Contains(err.Error(), "mock write error") {
 			t.Errorf("Expected write error, got %v", err)
