@@ -17,7 +17,18 @@ import (
 )
 
 // diffRegex は [-old-]{+new+} の形式をキャプチャします。
-var diffRegex = regexp.MustCompile(`^\s*\[\-(.*?)\-\]\{\+(.*?)\+\}\s*$`)
+// 1. Change: [-old-]{+new+} OR {-old-}{+new+}
+var diffRegexChange = regexp.MustCompile(`(?s)^\s*(?:\[\-(.*?)\-\]|\{\-(.*?)\-\})\s*\{\+(.*?)\+\}\s*$`)
+
+// 2. Add: {+new+}
+var diffRegexAdd = regexp.MustCompile(`(?s)^\s*\{\+(.*?)\+\}\s*$`)
+
+// 3. Delete: [-old-] OR {-old-}
+var diffRegexDel = regexp.MustCompile(`(?s)^\s*(?:\[\-(.*?)\-\]|\{\-(.*?)\-\})\s*$`)
+
+// 行全体の差分判定用
+var rowAddRegex = regexp.MustCompile(`^\s*\{\+(.*)\+\}\s*$`)
+var rowDelRegex = regexp.MustCompile(`^\s*(?:\[\-(.*)\-\]|\{\-(.*)\-\})\s*$`)
 
 // dmpPool は *diffmatchpatch.DiffMatchPatch オブジェクトをプールします
 var dmpPool = sync.Pool{
@@ -28,23 +39,100 @@ var dmpPool = sync.Pool{
 
 // Config はフラグの値を保持する構造体
 type Config struct {
-	InputPath    string // 空の場合は stdin を示す
+	InputPath    string
 	OutputPath   string
 	FormatHTML   bool
 	LightMode    bool
 	EnableFilter bool
+	TrimSpaces   bool
+	UseCSVQuote  bool
 	LineLimit    int
 	FontFamily   string
 	Headers      []string
 }
 
+// RecordReader はCSVのようなレコード読み込みの抽象化インターフェースです
+type RecordReader interface {
+	Read() ([]string, error)
+}
+
+// SimpleCSVReader はクォートを考慮せず単純にカンマで区切るリーダーです
+type SimpleCSVReader struct {
+	scanner *bufio.Scanner
+}
+
+func NewSimpleCSVReader(r io.Reader) *SimpleCSVReader {
+	return &SimpleCSVReader{scanner: bufio.NewScanner(r)}
+}
+
+func (r *SimpleCSVReader) Read() ([]string, error) {
+	if !r.scanner.Scan() {
+		err := r.scanner.Err()
+		if err == nil {
+			return nil, io.EOF
+		}
+		return nil, err
+	}
+	line := r.scanner.Text()
+
+	// 1. 行全体が追加/削除マーカーで囲まれているかチェック
+	var isRowAdd, isRowDel bool
+	var content string
+
+	if matches := rowAddRegex.FindStringSubmatch(line); matches != nil {
+		isRowAdd = true
+		content = matches[1]
+	} else if matches := rowDelRegex.FindStringSubmatch(line); matches != nil {
+		isRowDel = true
+		content = matches[1]
+		if content == "" {
+			content = matches[2]
+		}
+	} else {
+		content = line
+	}
+
+	// 2. カンマで分割
+	fields := strings.Split(content, ",")
+
+	// 3. 各フィールドの後処理
+	for i, field := range fields {
+		// クォート除去
+		if len(field) >= 2 && strings.HasPrefix(field, "\"") && strings.HasSuffix(field, "\"") {
+			fields[i] = field[1 : len(field)-1]
+		}
+
+		// 行全体が追加/削除だった場合、各セルにもマーカーを付与
+		if isRowAdd {
+			fields[i] = "{+" + fields[i] + "+}"
+		} else if isRowDel {
+			fields[i] = "[-" + fields[i] + "-]"
+		}
+	}
+	return fields, nil
+}
+
+// removeBOM はUTF-8のBOMがあれば除去したReaderを返します
+func removeBOM(r io.Reader) io.Reader {
+	br := bufio.NewReader(r)
+	r1, _, err := br.ReadRune()
+	if err != nil {
+		return br
+	}
+	if r1 != '\uFEFF' {
+		br.UnreadRune()
+	}
+	return br
+}
+
 func main() {
-	// 1. フラグをパース
 	inputPath := flag.String("i", "", "入力CSVファイルパス (省略した場合は標準入力から読み込み)")
 	outputPath := flag.String("o", "", "出力ファイルパス (必須)")
 	formatHTML := flag.Bool("html", false, "HTML形式で出力する")
 	lightMode := flag.Bool("light", false, "軽量リスト形式(差分のみ)で出力します (デフォルトは全データ形式)")
 	enableFilter := flag.Bool("filter", false, "HTMLテーブル出力時にフィルタ機能(JavaScript)を追加します")
+	trimSpaces := flag.Bool("trim", false, "差分がないセルの末尾の全角スペースのみを削除して表示幅を最適化します")
+	useCSVQuote := flag.Bool("strict-csv", false, "CSVの厳密なクォート処理(\")を有効にします。指定しない場合、\"は単なる文字として扱われ、行単位で単純分割されます")
 	lineLimit := flag.Int("n", 0, "処理する最大行数を指定します (0の場合は全行を処理)")
 	defaultFontStack := `"Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Hiragino Sans", Meiryo, sans-serif`
 	fontFamily := flag.String("font", defaultFontStack, "HTML出力時に使用するCSSのfont-familyを指定します")
@@ -52,20 +140,24 @@ func main() {
 
 	flag.Parse()
 
-	// 2. slog ロガーをセットアップ
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	// 3. -o のみチェック
 	if *outputPath == "" {
 		logger.Error("エラー: -o (出力パス) は必須です。")
 		flag.Usage()
 		os.Exit(1)
 	}
 
-	// 4. -header を csv.Reader で堅牢にパース
 	var headers []string
 	if *headerStr != "" {
-		r := csv.NewReader(strings.NewReader(*headerStr))
+		var r RecordReader
+		if *useCSVQuote {
+			csvR := csv.NewReader(strings.NewReader(*headerStr))
+			csvR.LazyQuotes = true
+			r = csvR
+		} else {
+			r = NewSimpleCSVReader(strings.NewReader(*headerStr))
+		}
 		var err error
 		headers, err = r.Read()
 		if err != nil {
@@ -74,19 +166,19 @@ func main() {
 		}
 	}
 
-	// 5. Config 構造体に格納
 	cfg := Config{
 		InputPath:    *inputPath,
 		OutputPath:   *outputPath,
 		FormatHTML:   *formatHTML,
 		LightMode:    *lightMode,
 		EnableFilter: *enableFilter,
+		TrimSpaces:   *trimSpaces,
+		UseCSVQuote:  *useCSVQuote,
 		LineLimit:    *lineLimit,
 		FontFamily:   *fontFamily,
 		Headers:      headers,
 	}
 
-	// 6. 入力ストリームのセットアップ
 	var inStream io.ReadCloser
 	var err error
 
@@ -103,7 +195,8 @@ func main() {
 	}
 	defer inStream.Close()
 
-	// 7. 出力ファイルのセットアップ
+	bomFreeReader := removeBOM(inStream)
+
 	outFile, err := os.Create(cfg.OutputPath)
 	if err != nil {
 		logger.Error("出力ファイルを作成できません", "path", cfg.OutputPath, "error", err)
@@ -111,13 +204,19 @@ func main() {
 	}
 	defer outFile.Close()
 
-	// 8. Reader/Writer を作成
-	reader := csv.NewReader(inStream)
-	reader.ReuseRecord = true
+	var reader RecordReader
+	if cfg.UseCSVQuote {
+		csvR := csv.NewReader(bomFreeReader)
+		csvR.ReuseRecord = true
+		csvR.LazyQuotes = true
+		reader = csvR
+	} else {
+		reader = NewSimpleCSVReader(bomFreeReader)
+	}
+
 	writer := bufio.NewWriter(outFile)
 	defer writer.Flush()
 
-	// 9. ロジック本体を呼び出す
 	dmp := dmpPool.Get().(*diffmatchpatch.DiffMatchPatch)
 	defer dmpPool.Put(dmp)
 
@@ -126,7 +225,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 10. 完了メッセージ
 	if cfg.LineLimit > 0 {
 		fmt.Printf("先頭 %d 行の差分ハイライト処理が完了しました: %s\n", cfg.LineLimit, cfg.OutputPath)
 	} else {
@@ -134,39 +232,31 @@ func main() {
 	}
 }
 
-// executeProcessing は、I/O(Reader/Writer)と設定(Config)を引数にとる、テスト可能な関数
-func executeProcessing(cfg Config, reader *csv.Reader, writer io.Writer, dmp *diffmatchpatch.DiffMatchPatch, logger *slog.Logger) error {
+func executeProcessing(cfg Config, reader RecordReader, writer io.Writer, dmp *diffmatchpatch.DiffMatchPatch, logger *slog.Logger) error {
 	if cfg.LightMode {
-		// --- 軽量リストモード (差分のみ) ---
 		csvWriter := csv.NewWriter(writer)
-
 		if cfg.FormatHTML {
 			logger.Info("HTML形式 (軽量リスト) で処理を開始します...")
 			return processHTMLAsList(reader, writer, dmp, cfg.FontFamily, cfg.LineLimit, cfg.Headers)
 		}
-		// 軽量 CSV リスト
 		logger.Info("CSV形式 (軽量リスト) で処理を開始します...")
 		err := processCSVAsList(reader, csvWriter, dmp, cfg.LineLimit, cfg.Headers)
-		csvWriter.Flush() // csvWriterのバッファを io.Writer に書き出す
+		csvWriter.Flush()
 		return err
-
 	}
-	// --- 全データモード (デフォルト) ---
-	csvWriter := csv.NewWriter(writer)
 
+	csvWriter := csv.NewWriter(writer)
 	if cfg.FormatHTML {
 		logger.Info("HTML形式 (全データテーブル) で処理を開始します...")
-		return processHTMLAsTable(reader, writer, dmp, cfg.FontFamily, cfg.LineLimit, cfg.Headers, cfg.EnableFilter)
+		return processHTMLAsTable(reader, writer, dmp, cfg.FontFamily, cfg.LineLimit, cfg.Headers, cfg.EnableFilter, cfg.TrimSpaces)
 	}
-	// 全データ CSV
 	logger.Info("CSV形式 (全データ) で処理を開始します...")
-	err := processCSVAsFull(reader, csvWriter, dmp, cfg.LineLimit, cfg.Headers)
-	csvWriter.Flush() // csvWriterのバッファを io.Writer に書き出す
+	err := processCSVAsFull(reader, csvWriter, dmp, cfg.LineLimit, cfg.Headers, cfg.TrimSpaces)
+	csvWriter.Flush()
 	return err
 }
 
-// processCSVAsFull は、全データをCSV形式で出力します。
-func processCSVAsFull(reader *csv.Reader, writer *csv.Writer, dmp *diffmatchpatch.DiffMatchPatch, lineLimit int, headers []string) error {
+func processCSVAsFull(reader RecordReader, writer *csv.Writer, dmp *diffmatchpatch.DiffMatchPatch, lineLimit int, headers []string, trimSpaces bool) error {
 	var lineCount int
 	if headers != nil {
 		if err := writer.Write(headers); err != nil {
@@ -190,10 +280,20 @@ func processCSVAsFull(reader *csv.Reader, writer *csv.Writer, dmp *diffmatchpatc
 		outputRecord := make([]string, len(record))
 		for i, cell := range record {
 			diffs, isDiff := parseDiffCell(cell, dmp)
+			// 変更点: isDiffがtrueでもtrimSpacesが有効ならトリムを行う
+			if trimSpaces {
+				trimDiffsRight(diffs)
+			}
+
 			if isDiff {
 				outputRecord[i] = formatDiffsToText(diffs)
 			} else {
-				outputRecord[i] = cell
+				// isDiff=falseでもdiffsは返るので、formatDiffsToTextを使っても同じ結果になるが、
+				// 念のため従来のロジック(単純なTrim)も残すか、統一するか。
+				// ここではシンプルに、すでにトリム済みのdiffsを使う形に統一もできるが、
+				// 既存ロジックへの影響を最小限にするため、分岐を残す。
+				// ただし、parseDiffCellは非差分ならnilを返すので、非差分の場合は手動でトリム
+				outputRecord[i] = strings.TrimRight(cell, "　")
 			}
 		}
 
@@ -204,8 +304,7 @@ func processCSVAsFull(reader *csv.Reader, writer *csv.Writer, dmp *diffmatchpatc
 	return nil
 }
 
-// processCSVAsList は、差分のみを CSV (行,列,値) 形式で出力します。
-func processCSVAsList(reader *csv.Reader, writer *csv.Writer, dmp *diffmatchpatch.DiffMatchPatch, lineLimit int, headers []string) error {
+func processCSVAsList(reader RecordReader, writer *csv.Writer, dmp *diffmatchpatch.DiffMatchPatch, lineLimit int, headers []string) error {
 	var lineCount int
 	if err := writer.Write([]string{"Line", "Column", "DiffValue"}); err != nil {
 		return fmt.Errorf("軽量CSVヘッダーの書き込みに失敗: %w", err)
@@ -224,7 +323,7 @@ func processCSVAsList(reader *csv.Reader, writer *csv.Writer, dmp *diffmatchpatc
 		}
 		lineCount++
 
-		for colNum, cell := range record { // colNum は 0-based
+		for colNum, cell := range record {
 			diffs, isDiff := parseDiffCell(cell, dmp)
 			if isDiff {
 				diffText := formatDiffsToText(diffs)
@@ -233,9 +332,9 @@ func processCSVAsList(reader *csv.Reader, writer *csv.Writer, dmp *diffmatchpatc
 					colStr = fmt.Sprintf("%d:%s", colNum+1, headers[colNum])
 				}
 				row := []string{
-					fmt.Sprintf("%d", lineCount), // Line
-					colStr,                       // Column
-					diffText,                     // DiffValue
+					fmt.Sprintf("%d", lineCount),
+					colStr,
+					diffText,
 				}
 				if err := writer.Write(row); err != nil {
 					return fmt.Errorf("軽量CSV行の書き込みに失敗 (line %d): %w", lineCount, err)
@@ -246,8 +345,7 @@ func processCSVAsList(reader *csv.Reader, writer *csv.Writer, dmp *diffmatchpatc
 	return nil
 }
 
-// processHTMLAsList は、差分があった箇所のみをリスト形式で書き出します。
-func processHTMLAsList(reader *csv.Reader, writer io.Writer, dmp *diffmatchpatch.DiffMatchPatch, fontFamily string, lineLimit int, headers []string) error {
+func processHTMLAsList(reader RecordReader, writer io.Writer, dmp *diffmatchpatch.DiffMatchPatch, fontFamily string, lineLimit int, headers []string) error {
 	var err error
 	write := func(s string) {
 		if err != nil {
@@ -291,8 +389,7 @@ func processHTMLAsList(reader *csv.Reader, writer io.Writer, dmp *diffmatchpatch
 	return err
 }
 
-// processHTMLAsTable は、全データをテーブル形式で書き出します。
-func processHTMLAsTable(reader *csv.Reader, writer io.Writer, dmp *diffmatchpatch.DiffMatchPatch, fontFamily string, lineLimit int, headers []string, enableFilter bool) error {
+func processHTMLAsTable(reader RecordReader, writer io.Writer, dmp *diffmatchpatch.DiffMatchPatch, fontFamily string, lineLimit int, headers []string, enableFilter bool, trimSpaces bool) error {
 	writeHTMLHeaderTable(writer, fontFamily, headers, enableFilter)
 
 	io.WriteString(writer, "<tbody>\n")
@@ -312,34 +409,101 @@ func processHTMLAsTable(reader *csv.Reader, writer io.Writer, dmp *diffmatchpatc
 		lineCount++
 
 		outputCells := make([]string, len(record))
+
+		isRowAdd := true
+		isRowDel := true
+		hasDiff := false
+
 		for i, cell := range record {
 			diffs, isDiff := parseDiffCell(cell, dmp)
+
+			// 変更点: isDiffがtrueでもtrimSpacesが有効ならトリムを行う
+			if trimSpaces && isDiff {
+				trimDiffsRight(diffs)
+			}
+
 			if isDiff {
+				hasDiff = true
 				outputCells[i] = formatDiffsToHTML(diffs)
+
+				if !isAllType(diffs, diffmatchpatch.DiffInsert) {
+					isRowAdd = false
+				}
+				if !isAllType(diffs, diffmatchpatch.DiffDelete) {
+					isRowDel = false
+				}
 			} else {
-				outputCells[i] = html.EscapeString(cell)
+				if trimSpaces {
+					outputCells[i] = html.EscapeString(strings.TrimRight(cell, "　"))
+				} else {
+					outputCells[i] = html.EscapeString(cell)
+				}
+
+				if cell != "" {
+					isRowAdd = false
+					isRowDel = false
+				}
 			}
 		}
-		writeHTMLDataRowTable(writer, outputCells)
+
+		rowClass := ""
+		if hasDiff {
+			if isRowAdd {
+				rowClass = "diff-row-add"
+			} else if isRowDel {
+				rowClass = "diff-row-del"
+			}
+		}
+
+		writeHTMLDataRowTable(writer, outputCells, rowClass)
 	}
 	io.WriteString(writer, "</tbody>\n")
 	writeHTMLFooterTable(writer, enableFilter)
 	return nil
 }
 
-// --- セル処理関数 ---
+// 変更点: Diffリストの末尾から全角スペースを削除する関数
+func trimDiffsRight(diffs []diffmatchpatch.Diff) {
+	if len(diffs) == 0 {
+		return
+	}
+	lastIdx := len(diffs) - 1
+	// 全角スペースのみをトリム
+	diffs[lastIdx].Text = strings.TrimRight(diffs[lastIdx].Text, "　")
+}
+
+func isAllType(diffs []diffmatchpatch.Diff, t diffmatchpatch.Operation) bool {
+	for _, d := range diffs {
+		if d.Type != t {
+			return false
+		}
+	}
+	return true
+}
 
 func parseDiffCell(cell string, dmp *diffmatchpatch.DiffMatchPatch) ([]diffmatchpatch.Diff, bool) {
-	matches := diffRegex.FindStringSubmatch(cell)
-	if matches == nil {
-		return nil, false
+	if matches := diffRegexChange.FindStringSubmatch(cell); matches != nil {
+		oldText := matches[1]
+		if oldText == "" {
+			oldText = matches[2]
+		}
+		newText := matches[3]
+		diffs := dmp.DiffMain(oldText, newText, false)
+		dmp.DiffCleanupSemantic(diffs)
+		return diffs, true
 	}
-	// [1] = oldVal, [2] = newVal
-	oldVal := matches[1]
-	newVal := matches[2]
-	diffs := dmp.DiffMain(oldVal, newVal, false)
-	dmp.DiffCleanupSemantic(diffs)
-	return diffs, true
+	if matches := diffRegexAdd.FindStringSubmatch(cell); matches != nil {
+		return []diffmatchpatch.Diff{{Type: diffmatchpatch.DiffInsert, Text: matches[1]}}, true
+	}
+	if matches := diffRegexDel.FindStringSubmatch(cell); matches != nil {
+		text := matches[1]
+		if text == "" {
+			text = matches[2]
+		}
+		return []diffmatchpatch.Diff{{Type: diffmatchpatch.DiffDelete, Text: text}}, true
+	}
+
+	return nil, false
 }
 
 func formatDiffsToText(diffs []diffmatchpatch.Diff) string {
@@ -384,9 +548,6 @@ func writeHTMLHeaderList(w io.Writer, fontFamily string) {
     <meta charset="UTF-8">
     <title>差分比較結果 (不一致リスト)</title>
     <style>
-`)
-	fmt.Fprintf(w, "        body { font-family: %s; }\n", safeFontFamily)
-	io.WriteString(w, `
         .diff-del { color: #d32f2f; text-decoration: line-through; background-color: #ffebee; }
         .diff-add { color: #388e3c; font-weight: bold; text-decoration: none; background-color: #e8f5e9; }
         .diff-line { padding: 8px 12px; border-bottom: 1px solid #eee; line-height: 1.5; background-color: #f9f9f9; }
@@ -428,12 +589,14 @@ func writeHTMLHeaderTable(w io.Writer, fontFamily string, headers []string, enab
     <meta charset="UTF-8">
     <title>差分比較結果 (全データ)</title>
     <style>
-`)
-	fmt.Fprintf(w, "        body { font-family: %s; }\n", safeFontFamily)
-	io.WriteString(w, `
         .diff-del { color: #d32f2f; text-decoration: line-through; background-color: #ffebee; }
         .diff-add { color: #388e3c; font-weight: bold; text-decoration: none; background-color: #e8f5e9; }
-        table { border-collapse: collapse; margin: 20px 0; font-size: 0.9em; }
+        
+        .diff-row-add { background-color: #e6ffed !important; }
+        .diff-row-del { background-color: #ffeef0 !important; }
+
+        table { border-collapse: collapse; margin: 0; font-size: 0.9em; min-width: 100%; }
+        
         th, td { 
             border: 1px solid #ccc; 
             padding: 8px 12px; 
@@ -441,8 +604,20 @@ func writeHTMLHeaderTable(w io.Writer, fontFamily string, headers []string, enab
             text-align: left; 
             white-space: nowrap; 
         }
-        thead th { background-color: #f0f0f0; }
+        th {
+            position: sticky;
+            top: 0;
+            background-color: #f0f0f0;
+            z-index: 10;
+            box-shadow: 0 2px 2px -1px rgba(0, 0, 0, 0.4);
+        }
         tbody tr:nth-child(odd) { background-color: #f9f9f9; }
+        
+        .table-wrapper {
+            overflow: auto;
+            max-height: 95vh;
+            border: 1px solid #ccc;
+        }
 `)
 	if enableFilter {
 		io.WriteString(w, `
@@ -454,6 +629,7 @@ func writeHTMLHeaderTable(w io.Writer, fontFamily string, headers []string, enab
             border: 1px solid #ccc;
             border-radius: 3px;
             font-size: 0.9em;
+            font-weight: normal;
         }
 `)
 	}
@@ -462,7 +638,7 @@ func writeHTMLHeaderTable(w io.Writer, fontFamily string, headers []string, enab
 </head>
 <body>
     <h1>差分比較結果 (全データ)</h1>
-    <div style="overflow-x: auto;">
+    <div class="table-wrapper">
         <table id="diffTable">
 `)
 	if headers != nil {
@@ -474,8 +650,12 @@ func writeHTMLHeaderTable(w io.Writer, fontFamily string, headers []string, enab
 	}
 }
 
-func writeHTMLDataRowTable(w io.Writer, cells []string) {
-	io.WriteString(w, "<tr>\n")
+func writeHTMLDataRowTable(w io.Writer, cells []string, rowClass string) {
+	if rowClass != "" {
+		fmt.Fprintf(w, "<tr class=\"%s\">\n", rowClass)
+	} else {
+		io.WriteString(w, "<tr>\n")
+	}
 	for _, c := range cells {
 		fmt.Fprintf(w, "    <td>%s</td>\n", c)
 	}
@@ -502,6 +682,8 @@ func writeHTMLFooterTable(w io.Writer, enableFilter bool) {
         input.type = "text";
         input.className = "filter-input";
         input.placeholder = "Filter...";
+        
+        input.addEventListener("click", function(e) { e.stopPropagation(); });
         input.addEventListener("input", function() {
             filterTable();
         });

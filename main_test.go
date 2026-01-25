@@ -15,15 +15,61 @@ import (
 
 // --- テスト用のヘルパー ---
 
-// newCsvReader は文字列から *csv.Reader を作成します
-func newCsvReader(s string) *csv.Reader {
-	return csv.NewReader(strings.NewReader(s))
+// newReader は、Configに応じて適切なリーダーを返します
+func newReader(s string, useQuote bool) RecordReader {
+	r := strings.NewReader(s)
+	if useQuote {
+		csvR := csv.NewReader(r)
+		csvR.LazyQuotes = true
+		return csvR
+	}
+	return NewSimpleCSVReader(r)
+}
+
+// SimpleCSVReader のクォート除去ロジックと行全体処理のテスト
+func TestSimpleCSVReader(t *testing.T) {
+	t.Run("Quotes", func(t *testing.T) {
+		input := `1,"Apple","","　　"`
+		reader := NewSimpleCSVReader(strings.NewReader(input))
+		record, err := reader.Read()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		expected := []string{"1", "Apple", "", "　　"}
+		if len(record) != len(expected) {
+			t.Fatalf("expected length %d, got %d", len(expected), len(record))
+		}
+		for i, val := range record {
+			if val != expected[i] {
+				t.Errorf("field[%d]: expected %q, got %q", i, expected[i], val)
+			}
+		}
+	})
+
+	t.Run("RowAdd", func(t *testing.T) {
+		input := `{+"A","B","C"+}`
+		reader := NewSimpleCSVReader(strings.NewReader(input))
+		record, err := reader.Read()
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// 各セルに {+ +} が分配されているか
+		expected := []string{"{+A+}", "{+B+}", "{+C+}"}
+		if len(record) != len(expected) {
+			t.Fatalf("expected length %d, got %d", len(expected), len(record))
+		}
+		for i, val := range record {
+			if val != expected[i] {
+				t.Errorf("field[%d]: expected %q, got %q", i, expected[i], val)
+			}
+		}
+	})
 }
 
 func runTest(t *testing.T, cfg Config, input string) (string, error) {
 	t.Helper()
 
-	reader := newCsvReader(input)
+	reader := newReader(input, cfg.UseCSVQuote)
 	var outBuf bytes.Buffer
 	writer := bufio.NewWriter(&outBuf)
 
@@ -52,7 +98,7 @@ func TestParseDiffCell(t *testing.T) {
 	dmp := dmpPool.Get().(*diffmatchpatch.DiffMatchPatch)
 	defer dmpPool.Put(dmp)
 
-	t.Run("IsDiff", func(t *testing.T) {
+	t.Run("Change: [-A-]{+B+}", func(t *testing.T) {
 		cell := "[-old text-]{+new text+}"
 		diffs, isDiff := parseDiffCell(cell, dmp)
 		if !isDiff {
@@ -61,8 +107,44 @@ func TestParseDiffCell(t *testing.T) {
 		if len(diffs) != 3 {
 			t.Fatalf("expected 3 diff segments, got %d", len(diffs))
 		}
-		if diffs[0].Type != diffmatchpatch.DiffInsert || diffs[0].Text != "new" {
-			t.Errorf("Unexpected diff[0]: %v", diffs[0])
+	})
+
+	t.Run("Add: {+A+}", func(t *testing.T) {
+		cell := "{+added text+}"
+		diffs, isDiff := parseDiffCell(cell, dmp)
+		if !isDiff {
+			t.Fatal("isDiff should be true")
+		}
+		if len(diffs) != 1 || diffs[0].Type != diffmatchpatch.DiffInsert {
+			t.Fatalf("expected 1 insert diff, got %v", diffs)
+		}
+		if diffs[0].Text != "added text" {
+			t.Errorf("expected 'added text', got %q", diffs[0].Text)
+		}
+	})
+
+	t.Run("Delete: [-A-]", func(t *testing.T) {
+		cell := "[-deleted text-]"
+		diffs, isDiff := parseDiffCell(cell, dmp)
+		if !isDiff {
+			t.Fatal("isDiff should be true")
+		}
+		if len(diffs) != 1 || diffs[0].Type != diffmatchpatch.DiffDelete {
+			t.Fatalf("expected 1 delete diff, got %v", diffs)
+		}
+		if diffs[0].Text != "deleted text" {
+			t.Errorf("expected 'deleted text', got %q", diffs[0].Text)
+		}
+	})
+
+	t.Run("Delete: {-A-}", func(t *testing.T) {
+		cell := "{-deleted text-}"
+		diffs, isDiff := parseDiffCell(cell, dmp)
+		if !isDiff {
+			t.Fatal("isDiff should be true")
+		}
+		if len(diffs) != 1 || diffs[0].Type != diffmatchpatch.DiffDelete {
+			t.Fatalf("expected 1 delete diff, got %v", diffs)
 		}
 	})
 
@@ -109,6 +191,9 @@ const testInputDiff = `1,Apple,[-OK-]{+NG+},[-Note 1-]{+Note 2+}
 const testInputNoDiff = `1,Apple,OK,Note 1
 2,Banana,OK,Note 3`
 
+// 末尾にスペースを含むテストデータ
+const testInputWithSpaces = "1,Apple   ,OK,Note 1   \n2,Banana　　,OK,Note 3"
+
 var testHeaders = []string{"ID", "Item", "Status", "Memo"}
 
 // 1. 全データ CSV (-light なし)
@@ -126,6 +211,39 @@ func TestProcessCSVAsFull(t *testing.T) {
 `
 		if out != expected {
 			t.Errorf("Expected:\n%s\nGot:\n%s", expected, out)
+		}
+	})
+
+	t.Run("TrimSpaces", func(t *testing.T) {
+		cfgTrim := cfg
+		cfgTrim.TrimSpaces = true
+		out, err := runTest(t, cfgTrim, testInputWithSpaces)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 末尾の全角スペースのみが削除されていることを確認 (Appleの半角スペースは残る)
+		expected := `1,Apple   ,OK,Note 1   
+2,Banana,OK,Note 3
+`
+		if out != expected {
+			t.Errorf("Expected:\n%q\nGot:\n%q", expected, out)
+		}
+	})
+
+	t.Run("RowAddTrim", func(t *testing.T) {
+		cfgTrim := cfg
+		cfgTrim.TrimSpaces = true
+		// 行全体の追加で、中身に全角スペースがある場合
+		input := `{+"A　　","B　"+}`
+		out, err := runTest(t, cfgTrim, input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// {+A+},{+B+} のように、スペースが除去された状態で出力されることを期待
+		expected := `{+A+},{+B+}
+`
+		if out != expected {
+			t.Errorf("Expected:\n%q\nGot:\n%q", expected, out)
 		}
 	})
 
@@ -213,6 +331,23 @@ func TestProcessHTMLAsTable(t *testing.T) {
 		}
 		if !strings.Contains(out, `.filter-input`) {
 			t.Error("Should contain filter CSS")
+		}
+	})
+
+	// 行全体追加・削除のスタイルテスト
+	t.Run("RowStyle", func(t *testing.T) {
+		// 行全体が {+ ... +} で囲まれた入力
+		input := `{+"A","B"+}
+[-"C","D"-]`
+		out, err := runTest(t, cfg, input)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(out, `<tr class="diff-row-add">`) {
+			t.Error("Missing diff-row-add class")
+		}
+		if !strings.Contains(out, `<tr class="diff-row-del">`) {
+			t.Error("Missing diff-row-del class")
 		}
 	})
 }
@@ -338,8 +473,8 @@ func TestProcessHTMLAsList(t *testing.T) {
 // mockErrorReader は Read() でエラーを返します
 type mockErrorReader struct{}
 
-func (m *mockErrorReader) Read(p []byte) (n int, err error) {
-	return 0, errors.New("mock read error")
+func (m *mockErrorReader) Read() ([]string, error) {
+	return nil, errors.New("mock read error")
 }
 
 // mockErrorWriter は Write() でエラーを返します
@@ -356,15 +491,15 @@ func TestIOErrors(t *testing.T) {
 
 	// --- Read エラーのテスト ---
 	t.Run("ReadError_CSVFull", func(t *testing.T) {
-		reader := csv.NewReader(&mockErrorReader{})
+		reader := &mockErrorReader{}
 		writer := csv.NewWriter(io.Discard)
-		err := processCSVAsFull(reader, writer, dmp, 0, nil)
+		err := processCSVAsFull(reader, writer, dmp, 0, nil, false)
 		if err == nil || !strings.Contains(err.Error(), "mock read error") {
 			t.Errorf("Expected read error, got %v", err)
 		}
 	})
 	t.Run("ReadError_CSVList", func(t *testing.T) {
-		reader := csv.NewReader(&mockErrorReader{})
+		reader := &mockErrorReader{}
 		writer := csv.NewWriter(io.Discard)
 		err := processCSVAsList(reader, writer, dmp, 0, nil)
 		if err == nil || !strings.Contains(err.Error(), "mock read error") {
@@ -372,15 +507,15 @@ func TestIOErrors(t *testing.T) {
 		}
 	})
 	t.Run("ReadError_HTMLTable", func(t *testing.T) {
-		reader := csv.NewReader(&mockErrorReader{})
+		reader := &mockErrorReader{}
 		writer := bufio.NewWriter(io.Discard)
-		err := processHTMLAsTable(reader, writer, dmp, "", 0, nil, false)
+		err := processHTMLAsTable(reader, writer, dmp, "", 0, nil, false, false)
 		if err == nil || !strings.Contains(err.Error(), "mock read error") {
 			t.Errorf("Expected read error, got %v", err)
 		}
 	})
 	t.Run("ReadError_HTMLList", func(t *testing.T) {
-		reader := csv.NewReader(&mockErrorReader{})
+		reader := &mockErrorReader{}
 		writer := bufio.NewWriter(io.Discard)
 		err := processHTMLAsList(reader, writer, dmp, "", 0, nil)
 		if err == nil || !strings.Contains(err.Error(), "mock read error") {
@@ -391,7 +526,7 @@ func TestIOErrors(t *testing.T) {
 	// --- Write エラーのテスト ---
 	t.Run("WriteError_CSVFull_Header", func(t *testing.T) {
 		cfg := Config{LightMode: false, FormatHTML: false, Headers: testHeaders}
-		reader := newCsvReader(testInputDiff)
+		reader := newReader(testInputDiff, false)
 		writer := &mockErrorWriter{}
 		err := executeProcessing(cfg, reader, writer, dmp, logger)
 		if err == nil || !strings.Contains(err.Error(), "mock write error") {
@@ -400,7 +535,7 @@ func TestIOErrors(t *testing.T) {
 	})
 	t.Run("WriteError_CSVFull_Data", func(t *testing.T) {
 		cfg := Config{LightMode: false, FormatHTML: false}
-		reader := newCsvReader(testInputDiff)
+		reader := newReader(testInputDiff, false)
 		writer := &mockErrorWriter{}
 		err := executeProcessing(cfg, reader, writer, dmp, logger)
 		if err == nil || !strings.Contains(err.Error(), "mock write error") {
@@ -410,7 +545,7 @@ func TestIOErrors(t *testing.T) {
 
 	t.Run("WriteError_CSVList_Header", func(t *testing.T) {
 		cfg := Config{LightMode: true, FormatHTML: false}
-		reader := newCsvReader(testInputDiff)
+		reader := newReader(testInputDiff, false)
 		writer := &mockErrorWriter{}
 		err := executeProcessing(cfg, reader, writer, dmp, logger)
 		if err == nil || !strings.Contains(err.Error(), "mock write error") {
@@ -420,7 +555,7 @@ func TestIOErrors(t *testing.T) {
 
 	t.Run("WriteError_HTMLList_Header", func(t *testing.T) {
 		cfg := Config{LightMode: true, FormatHTML: true}
-		reader := newCsvReader(testInputDiff)
+		reader := newReader(testInputDiff, false)
 		writer := &mockErrorWriter{}
 		err := executeProcessing(cfg, reader, writer, dmp, logger)
 		if err == nil || !strings.Contains(err.Error(), "mock write error") {
