@@ -14,6 +14,8 @@ import (
 	"sync"
 
 	"github.com/sergi/go-diff/diffmatchpatch"
+	"golang.org/x/text/encoding/japanese"
+	"golang.org/x/text/transform"
 )
 
 // diffRegex は [-old-]{+new+} の形式をキャプチャします。
@@ -49,6 +51,7 @@ type Config struct {
 	LineLimit    int
 	FontFamily   string
 	Headers      []string
+	SjisInput    bool
 }
 
 // RecordReader はCSVのようなレコード読み込みの抽象化インターフェースです
@@ -137,6 +140,7 @@ func main() {
 	defaultFontStack := `"Helvetica Neue", Arial, "Hiragino Kaku Gothic ProN", "Hiragino Sans", Meiryo, sans-serif`
 	fontFamily := flag.String("font", defaultFontStack, "HTML出力時に使用するCSSのfont-familyを指定します")
 	headerStr := flag.String("header", "", "CSVのヘッダー行をカンマ区切りで指定します")
+	sjisInput := flag.Bool("sjis", false, "入力ファイルをShift_JISとして読み込みます（出力はUTF-8）")
 
 	flag.Parse()
 
@@ -177,6 +181,7 @@ func main() {
 		LineLimit:    *lineLimit,
 		FontFamily:   *fontFamily,
 		Headers:      headers,
+		SjisInput:    *sjisInput,
 	}
 
 	var inStream io.ReadCloser
@@ -195,7 +200,13 @@ func main() {
 	}
 	defer inStream.Close()
 
-	bomFreeReader := removeBOM(inStream)
+	var readerInput io.Reader = inStream
+	if cfg.SjisInput {
+		logger.Info("入力をShift_JISとしてデコードします")
+		readerInput = transform.NewReader(inStream, japanese.ShiftJIS.NewDecoder())
+	}
+
+	bomFreeReader := removeBOM(readerInput)
 
 	outFile, err := os.Create(cfg.OutputPath)
 	if err != nil {
