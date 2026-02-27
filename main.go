@@ -540,11 +540,11 @@ func formatDiffsToHTML(diffs []diffmatchpatch.Diff) string {
 		case diffmatchpatch.DiffEqual:
 			builder.WriteString(escapedText)
 		case diffmatchpatch.DiffDelete:
-			// <del> の内側に <s> タグを追加してExcelに取り消し線を認識させる
-			fmt.Fprintf(&builder, `<del class="diff-del"><s>%.*s</s></del>`, len(escapedText), escapedText)
+			// <font color="..."> を使用して文字色を指定
+			fmt.Fprintf(&builder, `<del class="diff-del" style="background-color: #ffebee;"><font color="#d32f2f"><s>%.*s</s></font></del>`, len(escapedText), escapedText)
 		case diffmatchpatch.DiffInsert:
-			// ついでに追加部分の文字色などもExcelで確実に反映させたい場合は、こちらもインラインスタイルを追加するとより確実です
-			fmt.Fprintf(&builder, `<ins class="diff-add" style="color: #388e3c; font-weight: bold;">%.*s</ins>`, len(escapedText), escapedText)
+			// <font color="..."> と <b> (太字) タグを使用
+			fmt.Fprintf(&builder, `<ins class="diff-add" style="background-color: #e8f5e9;"><font color="#388e3c"><b>%.*s</b></font></ins>`, len(escapedText), escapedText)
 		}
 	}
 	return builder.String()
