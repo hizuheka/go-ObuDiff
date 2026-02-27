@@ -175,7 +175,7 @@ func TestFormatters(t *testing.T) {
 
 	t.Run("FormatHTML", func(t *testing.T) {
 		expected := `common<del class="diff-del">del</del><ins class="diff-add">add</ins>&lt;tag&gt;`
-		result := formatDiffsToHTML(diffs)
+		result := formatDiffsToHTML(diffs, false)
 		if result != expected {
 			t.Errorf("Expected %q, got %q", expected, result)
 		}
@@ -509,7 +509,7 @@ func TestIOErrors(t *testing.T) {
 	t.Run("ReadError_HTMLTable", func(t *testing.T) {
 		reader := &mockErrorReader{}
 		writer := bufio.NewWriter(io.Discard)
-		err := processHTMLAsTable(reader, writer, dmp, "", 0, nil, false, false)
+		err := processHTMLAsTable(reader, writer, dmp, "", 0, nil, false, false, false)
 		if err == nil || !strings.Contains(err.Error(), "mock read error") {
 			t.Errorf("Expected read error, got %v", err)
 		}
@@ -517,7 +517,7 @@ func TestIOErrors(t *testing.T) {
 	t.Run("ReadError_HTMLList", func(t *testing.T) {
 		reader := &mockErrorReader{}
 		writer := bufio.NewWriter(io.Discard)
-		err := processHTMLAsList(reader, writer, dmp, "", 0, nil)
+		err := processHTMLAsList(reader, writer, dmp, "", 0, nil, false)
 		if err == nil || !strings.Contains(err.Error(), "mock read error") {
 			t.Errorf("Expected read error, got %v", err)
 		}

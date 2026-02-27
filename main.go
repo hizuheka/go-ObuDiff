@@ -52,6 +52,7 @@ type Config struct {
 	FontFamily   string
 	Headers      []string
 	SjisInput    bool
+	ExcelMode    bool
 }
 
 // RecordReader はCSVのようなレコード読み込みの抽象化インターフェースです
@@ -141,6 +142,7 @@ func main() {
 	fontFamily := flag.String("font", defaultFontStack, "HTML出力時に使用するCSSのfont-familyを指定します")
 	headerStr := flag.String("header", "", "CSVのヘッダー行をカンマ区切りで指定します")
 	sjisInput := flag.Bool("sjis", false, "入力ファイルをShift_JISとして読み込みます（出力はUTF-8）")
+	excelMode := flag.Bool("excel", false, "ExcelでHTMLを開く際に見やすくするための互換スタイル(<font>タグ等)を出力します")
 
 	flag.Parse()
 
@@ -182,6 +184,7 @@ func main() {
 		FontFamily:   *fontFamily,
 		Headers:      headers,
 		SjisInput:    *sjisInput,
+		ExcelMode:    *excelMode,
 	}
 
 	var inStream io.ReadCloser
@@ -248,7 +251,7 @@ func executeProcessing(cfg Config, reader RecordReader, writer io.Writer, dmp *d
 		csvWriter := csv.NewWriter(writer)
 		if cfg.FormatHTML {
 			logger.Info("HTML形式 (軽量リスト) で処理を開始します...")
-			return processHTMLAsList(reader, writer, dmp, cfg.FontFamily, cfg.LineLimit, cfg.Headers)
+			return processHTMLAsList(reader, writer, dmp, cfg.FontFamily, cfg.LineLimit, cfg.Headers, cfg.ExcelMode)
 		}
 		logger.Info("CSV形式 (軽量リスト) で処理を開始します...")
 		err := processCSVAsList(reader, csvWriter, dmp, cfg.LineLimit, cfg.Headers)
@@ -259,7 +262,7 @@ func executeProcessing(cfg Config, reader RecordReader, writer io.Writer, dmp *d
 	csvWriter := csv.NewWriter(writer)
 	if cfg.FormatHTML {
 		logger.Info("HTML形式 (全データテーブル) で処理を開始します...")
-		return processHTMLAsTable(reader, writer, dmp, cfg.FontFamily, cfg.LineLimit, cfg.Headers, cfg.EnableFilter, cfg.TrimSpaces)
+		return processHTMLAsTable(reader, writer, dmp, cfg.FontFamily, cfg.LineLimit, cfg.Headers, cfg.EnableFilter, cfg.TrimSpaces, cfg.ExcelMode)
 	}
 	logger.Info("CSV形式 (全データ) で処理を開始します...")
 	err := processCSVAsFull(reader, csvWriter, dmp, cfg.LineLimit, cfg.Headers, cfg.TrimSpaces)
@@ -356,7 +359,7 @@ func processCSVAsList(reader RecordReader, writer *csv.Writer, dmp *diffmatchpat
 	return nil
 }
 
-func processHTMLAsList(reader RecordReader, writer io.Writer, dmp *diffmatchpatch.DiffMatchPatch, fontFamily string, lineLimit int, headers []string) error {
+func processHTMLAsList(reader RecordReader, writer io.Writer, dmp *diffmatchpatch.DiffMatchPatch, fontFamily string, lineLimit int, headers []string, exelMode bool) error {
 	var err error
 	write := func(s string) {
 		if err != nil {
@@ -386,7 +389,7 @@ func processHTMLAsList(reader RecordReader, writer io.Writer, dmp *diffmatchpatc
 			diffs, isDiff := parseDiffCell(cell, dmp)
 			if isDiff {
 				diffFoundCount++
-				htmlDiff := formatDiffsToHTML(diffs)
+				htmlDiff := formatDiffsToHTML(diffs, exelMode)
 				writeHTMLDiffLine(writer, lineCount, colNum+1, htmlDiff, headers)
 			}
 		}
@@ -400,7 +403,7 @@ func processHTMLAsList(reader RecordReader, writer io.Writer, dmp *diffmatchpatc
 	return err
 }
 
-func processHTMLAsTable(reader RecordReader, writer io.Writer, dmp *diffmatchpatch.DiffMatchPatch, fontFamily string, lineLimit int, headers []string, enableFilter bool, trimSpaces bool) error {
+func processHTMLAsTable(reader RecordReader, writer io.Writer, dmp *diffmatchpatch.DiffMatchPatch, fontFamily string, lineLimit int, headers []string, enableFilter bool, trimSpaces bool, exelMode bool) error {
 	writeHTMLHeaderTable(writer, fontFamily, headers, enableFilter)
 
 	io.WriteString(writer, "<tbody>\n")
@@ -435,7 +438,7 @@ func processHTMLAsTable(reader RecordReader, writer io.Writer, dmp *diffmatchpat
 
 			if isDiff {
 				hasDiff = true
-				outputCells[i] = formatDiffsToHTML(diffs)
+				outputCells[i] = formatDiffsToHTML(diffs, exelMode)
 
 				if !isAllType(diffs, diffmatchpatch.DiffInsert) {
 					isRowAdd = false
@@ -532,7 +535,7 @@ func formatDiffsToText(diffs []diffmatchpatch.Diff) string {
 	return builder.String()
 }
 
-func formatDiffsToHTML(diffs []diffmatchpatch.Diff) string {
+func formatDiffsToHTML(diffs []diffmatchpatch.Diff, excelMode bool) string {
 	var builder strings.Builder
 	for _, diff := range diffs {
 		escapedText := html.EscapeString(diff.Text)
@@ -540,11 +543,21 @@ func formatDiffsToHTML(diffs []diffmatchpatch.Diff) string {
 		case diffmatchpatch.DiffEqual:
 			builder.WriteString(escapedText)
 		case diffmatchpatch.DiffDelete:
-			// <font color="..."> を使用して文字色を指定
-			fmt.Fprintf(&builder, `<del class="diff-del" style="background-color: #ffebee;"><font color="#d32f2f"><s>%.*s</s></font></del>`, len(escapedText), escapedText)
+			if excelMode {
+				// Excel向けのレガシー出力
+				fmt.Fprintf(&builder, `<del class="diff-del" style="background-color: #ffebee;"><font color="#d32f2f"><s>%.*s</s></font></del>`, len(escapedText), escapedText)
+			} else {
+				// ブラウザ向けの標準出力（元に戻す）
+				fmt.Fprintf(&builder, `<del class="diff-del">%.*s</del>`, len(escapedText), escapedText)
+			}
 		case diffmatchpatch.DiffInsert:
-			// <font color="..."> と <b> (太字) タグを使用
-			fmt.Fprintf(&builder, `<ins class="diff-add" style="background-color: #e8f5e9;"><font color="#388e3c"><b>%.*s</b></font></ins>`, len(escapedText), escapedText)
+			if excelMode {
+				// Excel向けのレガシー出力
+				fmt.Fprintf(&builder, `<ins class="diff-add" style="background-color: #e8f5e9;"><font color="#388e3c"><b>%.*s</b></font></ins>`, len(escapedText), escapedText)
+			} else {
+				// ブラウザ向けの標準出力（元に戻す）
+				fmt.Fprintf(&builder, `<ins class="diff-add">%.*s</ins>`, len(escapedText), escapedText)
+			}
 		}
 	}
 	return builder.String()
