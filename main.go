@@ -574,7 +574,9 @@ func writeHTMLHeaderList(w io.Writer, fontFamily string) {
     <meta charset="UTF-8">
     <title>差分比較結果 (不一致リスト)</title>
     <style>
-        .diff-del { color: #d32f2f; text-decoration: line-through; background-color: #ffebee; }
+`)
+	fmt.Fprintf(w, "        body { font-family: %s; }\n", safeFontFamily)
+	io.WriteString(w, `        .diff-del { color: #d32f2f; text-decoration: line-through; background-color: #ffebee; }
         .diff-add { color: #388e3c; font-weight: bold; text-decoration: none; background-color: #e8f5e9; }
         .diff-line { padding: 8px 12px; border-bottom: 1px solid #eee; line-height: 1.5; background-color: #f9f9f9; }
         .diff-line:nth-child(even) { background-color: #fff; }
@@ -615,7 +617,9 @@ func writeHTMLHeaderTable(w io.Writer, fontFamily string, headers []string, enab
     <meta charset="UTF-8">
     <title>差分比較結果 (全データ)</title>
     <style>
-        .diff-del { color: #d32f2f; text-decoration: line-through; background-color: #ffebee; }
+`)
+	fmt.Fprintf(w, "        body { font-family: %s; }\n", safeFontFamily)
+	io.WriteString(w, `        .diff-del { color: #d32f2f; text-decoration: line-through; background-color: #ffebee; }
         .diff-add { color: #388e3c; font-weight: bold; text-decoration: none; background-color: #e8f5e9; }
         
         .diff-row-add { background-color: #e6ffed !important; }
